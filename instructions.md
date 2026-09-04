@@ -95,3 +95,32 @@ Groups:
 - Scheduling algorithm: [app/Services/SchedulingService.php](app/Services/SchedulingService.php)
 - Role gate middleware: [app/Http/Middleware/EnsureRole.php](app/Http/Middleware/EnsureRole.php) (alias `role`)
 - Route table: [routes/api.php](routes/api.php)
+- Filament panel: [app/Providers/Filament/AdminPanelProvider.php](app/Providers/Filament/AdminPanelProvider.php), resources under [app/Filament/Resources/](app/Filament/Resources/), dashboard widgets under [app/Filament/Widgets/](app/Filament/Widgets/)
+
+## Admin panel (Filament)
+
+The desktop admin panel lives at:
+
+```
+http://127.0.0.1:8000/admin
+```
+
+**Who can log in:** only users whose `role` is `admin` or `coordinator`. Surgeons are denied access — the panel is desktop-only for scheduling and audit; surgeons use the mobile app that consumes `/api`.
+
+Access is enforced by `User::canAccessPanel()` in [app/Models/User.php](app/Models/User.php).
+
+**Try each role (all use password `password`):**
+
+| Email | Result at /admin |
+|---|---|
+| admin@shifa.test     | ✅ full access (all resources, can delete surgeries) |
+| coord1@shifa.test    | ✅ access (can create/edit but cannot hard-delete surgeries) |
+| surgeon1@shifa.test  | ❌ 403 Forbidden |
+
+**Panel structure:**
+- **Dashboard** — stats overview (surgeries today, rooms in use, weekly count, pending suggestions) + weekly room-utilization bar chart + recent-surgeries table
+- **Scheduling** group — Surgeries (full CRUD with filters), Schedule Suggestions (read-only audit)
+- **People** group — Staff (with role-conditional specialty field), Patients
+- **Facilities** group — Operating Rooms, Surgery Types
+
+The panel and the `/api` routes are fully independent — nothing in the panel calls the API and vice versa.
