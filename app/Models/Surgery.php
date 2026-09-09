@@ -22,6 +22,8 @@ class Surgery extends Model
         'priority',
         'scheduled_start',
         'estimated_duration_min',
+        'delayed_end_at',
+        'delay_reason',
         'actual_start',
         'actual_end',
         'status',
@@ -29,6 +31,7 @@ class Surgery extends Model
 
     protected $casts = [
         'scheduled_start' => 'datetime',
+        'delayed_end_at' => 'datetime',
         'actual_start' => 'datetime',
         'actual_end' => 'datetime',
         'estimated_duration_min' => 'integer',
@@ -62,5 +65,31 @@ class Surgery extends Model
     public function scheduleSuggestions(): HasMany
     {
         return $this->hasMany(ScheduleSuggestion::class);
+    }
+
+    public function delayRequests(): HasMany
+    {
+        return $this->hasMany(DelayRequest::class);
+    }
+
+    /**
+     * Effective end of the scheduled window, used for ALL overlap/availability
+     * calculations and exposed via SurgeryResource as `scheduled_end`.
+     *
+     * If an auto-approved delay request set `delayed_end_at`, that overrides
+     * the computed (scheduled_start + estimated_duration_min) value — the
+     * original estimated_duration_min is left untouched as an audit trail of
+     * the original plan.
+     */
+    public function getScheduledEndAttribute(): ?\Illuminate\Support\Carbon
+    {
+        if ($this->delayed_end_at) {
+            return $this->delayed_end_at->copy();
+        }
+
+        if (! $this->scheduled_start || ! $this->estimated_duration_min) {
+            return null;
+        }
+        return $this->scheduled_start->copy()->addMinutes($this->estimated_duration_min);
     }
 }

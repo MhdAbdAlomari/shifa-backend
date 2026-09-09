@@ -18,6 +18,7 @@ class SurgeryResource extends JsonResource
             'created_by' => $this->created_by,
             'priority' => $this->priority,
             'scheduled_start' => $this->scheduled_start,
+            'scheduled_end' => $this->scheduled_end,
             'estimated_duration_min' => $this->estimated_duration_min,
             'actual_start' => $this->actual_start,
             'actual_end' => $this->actual_end,

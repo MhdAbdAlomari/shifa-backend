@@ -2,8 +2,10 @@
 
 namespace App\Services;
 
+use App\Models\DelayRequest;
 use App\Models\Notification;
 use App\Models\OperatingRoom;
+use App\Models\OperatingRoomSlot;
 use App\Models\ScheduleSuggestion;
 use App\Models\Surgery;
 use App\Models\SurgeryType;
@@ -14,9 +16,17 @@ use Carbon\CarbonImmutable;
 /**
  * Core scheduling logic for Shifa.
  *
- * Two responsibilities:
- *  1. autoSchedule()  — build a proposed schedule from a batch of pending surgeries.
- *  2. handleDelay()   — when a running surgery overruns, propose shifts for the rest of the day.
+ * Responsibilities:
+ *  1. autoSchedule()        — build a proposed schedule from a batch of pending surgeries.
+ *  2. handleDelay()         — when a running surgery overruns, propose shifts for the rest of the day.
+ *  3. evaluateDelayRequest() — the surgeon-initiated delay-report workflow (auto-approve or escalate).
+ *
+ * IMPORTANT: every occupancy calculation in this class uses a surgery's
+ * *effective end* — Surgery::$scheduled_end, which is delayed_end_at when
+ * set, otherwise scheduled_start + estimated_duration_min — never
+ * estimated_duration_min alone. This is what makes delayed surgeries'
+ * extended end times correctly block new bookings/proposals in the same
+ * room (see the autoSchedule regression fix below).
  */
 class SchedulingService
 {
@@ -73,11 +83,17 @@ class SchedulingService
             ->get();
 
         // Occupancy: per-room list of [start, end] intervals, and per-surgeon list.
+        // Uses each surgery's EFFECTIVE end (scheduled_end accessor), which
+        // accounts for delayed_end_at when a delay was auto-approved — NOT
+        // estimated_duration_min alone. This is the fix for the bug where
+        // auto-schedule proposed a slot that overlapped a delayed surgery
+        // whose real end time had been extended past its original estimate.
         $roomBusy = [];
         $surgeonBusy = [];
         foreach ($existing as $s) {
-            $roomBusy[$s->room_id][] = [$s->scheduled_start->copy(), $s->scheduled_start->copy()->addMinutes($s->estimated_duration_min)];
-            $surgeonBusy[$s->surgeon_id][] = [$s->scheduled_start->copy(), $s->scheduled_start->copy()->addMinutes($s->estimated_duration_min)];
+            $interval = [$s->scheduled_start->copy(), $s->scheduled_end->copy()];
+            $roomBusy[$s->room_id][] = $interval;
+            $surgeonBusy[$s->surgeon_id][] = $interval;
         }
 
         // 2. Sort: emergency first, then shortest average_duration_min first.
@@ -92,7 +108,13 @@ class SchedulingService
             return $dA <=> $dB;
         });
 
-        $earliestSlot = $today->setHour(self::DAY_START_HOUR)->setMinute(0)->setSecond(0);
+        // Floor of "now" — never propose a slot earlier than the current moment.
+        // (Bug fix: previously this always started from today at DAY_START_HOUR,
+        // which is in the past for any request made after 08:00.)
+        $now = CarbonImmutable::now();
+        $earliestSlot = $now->greaterThan($today->setHour(self::DAY_START_HOUR)->setMinute(0)->setSecond(0))
+            ? $now
+            : $today->setHour(self::DAY_START_HOUR)->setMinute(0)->setSecond(0);
 
         // 3. Greedy placement
         $proposals = [];
@@ -159,9 +181,202 @@ class SchedulingService
             $overrunMin = 30;
         }
 
+        $suggestions = $this->generateDownstreamSuggestions(
+            surgery: $surgery,
+            pushMinutes: $overrunMin,
+            reasonPrefix: "overrun of surgery #{$surgery->id} in the same room",
+        );
+
+        $this->notifyCoordinatorsOfSuggestions($suggestions);
+
+        return $suggestions;
+    }
+
+    /**
+     * Surgeon-initiated delay-report workflow.
+     *
+     * Input: the in_progress Surgery, the surgeon's proposed new_expected_end,
+     * and their reason. Evaluates whether extending this surgery's effective
+     * end to new_expected_end would overlap any OTHER non-cancelled surgery in
+     * the same room:
+     *
+     *   - NO CONFLICT: auto-approve immediately. Sets status=delayed,
+     *     delayed_end_at=new_expected_end, delay_reason=reason. No downstream
+     *     surgeries are touched.
+     *   - CONFLICT: the surgery's status and timing are left untouched (stays
+     *     in_progress). ScheduleSuggestion rows are generated for every
+     *     downstream surgery in the room (reusing the handleDelay pattern),
+     *     coordinators are notified, and the surgeon is told it's pending review.
+     *
+     * Every call is logged to delay_requests regardless of outcome.
+     *
+     * Returns ['auto_approved' => bool, 'surgery' => Surgery, 'suggestions' => ScheduleSuggestion[], 'conflict' => ?Surgery]
+     */
+    public function evaluateDelayRequest(Surgery $surgery, Carbon $newExpectedEnd, string $reason, User $requestedBy): array
+    {
+        $conflict = $this->findOverlappingSurgery(
+            roomId: $surgery->room_id,
+            start: $surgery->scheduled_start->copy(),
+            durationMin: null,
+            excludeSurgeryId: $surgery->id,
+            endOverride: $newExpectedEnd,
+        );
+
+        $autoApproved = $conflict === null;
+
+        DelayRequest::create([
+            'surgery_id' => $surgery->id,
+            'requested_by' => $requestedBy->id,
+            'new_expected_end' => $newExpectedEnd,
+            'reason' => $reason,
+            'auto_approved' => $autoApproved,
+        ]);
+
+        if ($autoApproved) {
+            $surgery->update([
+                'status' => 'delayed',
+                'delayed_end_at' => $newExpectedEnd,
+                'delay_reason' => $reason,
+            ]);
+
+            return [
+                'auto_approved' => true,
+                'surgery' => $surgery->fresh(['patient', 'surgeon', 'room', 'surgeryType']),
+                'suggestions' => [],
+                'conflict' => null,
+            ];
+        }
+
+        // Conflict exists — do NOT change this surgery's status/timing.
+        // Push overrun = gap between the surgeon's requested new end and the
+        // surgery's currently-effective end, so downstream suggestions shift
+        // by exactly the additional time being requested.
+        $currentEffectiveEnd = $surgery->scheduled_end;
+        $pushMinutes = max(1, (int) ceil($currentEffectiveEnd->diffInMinutes($newExpectedEnd, false)));
+
+        $suggestions = $this->generateDownstreamSuggestions(
+            surgery: $surgery,
+            pushMinutes: $pushMinutes,
+            reasonPrefix: "a pending delay request on surgery #{$surgery->id} in the same room",
+        );
+
+        $this->notifyCoordinatorsOfSuggestions($suggestions);
+
+        return [
+            'auto_approved' => false,
+            'surgery' => $surgery->fresh(['patient', 'surgeon', 'room', 'surgeryType']),
+            'suggestions' => $suggestions,
+            'conflict' => $conflict,
+        ];
+    }
+
+    // ---------------------------------------------------------------------
+    // Conflict validation (used by SurgeryController for manual scheduling,
+    // and internally by the auto-scheduler / delay handler).
+    // ---------------------------------------------------------------------
+
+    /**
+     * Check whether a candidate window overlaps any existing non-cancelled
+     * surgery in $roomId. Returns the conflicting Surgery, or null if free.
+     *
+     * The candidate window is [$start, $end) where $end is either:
+     *   - $endOverride, if given (used by evaluateDelayRequest, which knows
+     *     an exact proposed end time rather than a duration), or
+     *   - $start + $durationMin otherwise.
+     *
+     * Every existing surgery's own window is its EFFECTIVE end
+     * (Surgery::$scheduled_end — respects delayed_end_at), never
+     * estimated_duration_min alone, so a delayed surgery's extended end
+     * correctly blocks new overlapping bookings/proposals.
+     *
+     * @param int|null $excludeSurgeryId Exclude this surgery's own row (used on update).
+     */
+    public function findOverlappingSurgery(
+        int $roomId,
+        Carbon $start,
+        ?int $durationMin = null,
+        ?int $excludeSurgeryId = null,
+        ?Carbon $endOverride = null,
+    ): ?Surgery {
+        $end = $endOverride ?? $start->copy()->addMinutes($durationMin ?? 0);
+
+        $query = Surgery::where('room_id', $roomId)
+            ->where('status', '!=', 'cancelled')
+            ->where('scheduled_start', '<', $end);
+
+        if ($excludeSurgeryId !== null) {
+            $query->where('id', '!=', $excludeSurgeryId);
+        }
+
+        // A surgery overlaps if its own EFFECTIVE [start, end) intersects ours.
+        // We can't compare the computed `scheduled_end` in SQL, so fetch
+        // candidates that start before our end and check their effective end
+        // in PHP via the accessor (which honors delayed_end_at).
+        foreach ($query->get() as $candidate) {
+            $candidateEnd = $candidate->scheduled_end;
+            if ($start->lessThan($candidateEnd) && $end->greaterThan($candidate->scheduled_start)) {
+                return $candidate;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Check whether [start, start+durationMin) falls entirely within one of
+     * the room's defined availability slots for that day of week. Rooms with
+     * NO slots defined at all are treated as unrestricted (backward
+     * compatibility with rooms seeded before this feature existed).
+     */
+    public function isWithinRoomAvailability(int $roomId, Carbon $start, int $durationMin): bool
+    {
+        $slots = OperatingRoomSlot::where('room_id', $roomId)->get();
+
+        if ($slots->isEmpty()) {
+            return true;
+        }
+
+        $end = $start->copy()->addMinutes($durationMin);
+        // A booking must fit within a single slot window (no crossing midnight).
+        if ($end->dayOfWeek !== $start->dayOfWeek) {
+            return false;
+        }
+
+        $daySlots = $slots->where('day_of_week', $start->dayOfWeek);
+        if ($daySlots->isEmpty()) {
+            return false;
+        }
+
+        foreach ($daySlots as $slot) {
+            $slotStart = $start->copy()->setTimeFromTimeString($slot->start_time);
+            $slotEnd = $start->copy()->setTimeFromTimeString($slot->end_time);
+            if ($start->greaterThanOrEqualTo($slotStart) && $end->lessThanOrEqualTo($slotEnd)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Internals
+    // ---------------------------------------------------------------------
+
+    /**
+     * Shared downstream-suggestion generator used by both handleDelay() (surgeon
+     * marks in_progress surgery delayed with no specific end time — assumes an
+     * overrun) and evaluateDelayRequest() (surgeon reports a specific new end
+     * time that conflicts with a later surgery in the room).
+     *
+     * For every OTHER non-cancelled surgery scheduled in the SAME room LATER
+     * than $surgery, propose (a) delaying it by $pushMinutes in the same room
+     * (only if that still fits the room's availability window), and (b)
+     * moving it to an alternative room that fits at its original start time.
+     */
+    private function generateDownstreamSuggestions(Surgery $surgery, int $pushMinutes, string $reasonPrefix): array
+    {
         $suggestions = [];
 
-        // Find affected surgeries in the same room, later today.
         $affected = Surgery::with('surgeryType')
             ->where('room_id', $surgery->room_id)
             ->where('id', '!=', $surgery->id)
@@ -175,7 +390,7 @@ class SchedulingService
             return [];
         }
 
-        // Snapshot rooms + occupancy for option (b) evaluation.
+        // Snapshot rooms + occupancy (using effective ends) for option (b).
         $rooms = OperatingRoom::all();
         $today = CarbonImmutable::parse($surgery->scheduled_start)->startOfDay();
         $occupied = Surgery::whereDate('scheduled_start', $today)
@@ -184,22 +399,26 @@ class SchedulingService
 
         $roomBusy = [];
         foreach ($occupied as $s) {
-            $roomBusy[$s->room_id][] = [$s->scheduled_start->copy(), $s->scheduled_start->copy()->addMinutes($s->estimated_duration_min)];
+            $roomBusy[$s->room_id][] = [$s->scheduled_start->copy(), $s->scheduled_end->copy()];
         }
 
         foreach ($affected as $next) {
-            $newStart = $next->scheduled_start->copy()->addMinutes($overrunMin);
+            $newStart = $next->scheduled_start->copy()->addMinutes($pushMinutes);
             $duration = $next->estimated_duration_min;
             $requiredSpecialty = $next->surgeryType?->required_specialty;
 
-            // Option (a): delay in same room.
-            $suggestions[] = ScheduleSuggestion::create([
-                'surgery_id'        => $next->id,
-                'suggested_room_id' => $next->room_id,
-                'suggested_start'   => $newStart,
-                'reason'            => "Delayed by {$overrunMin} min due to overrun of surgery #{$surgery->id} in the same room.",
-                'status'            => 'pending',
-            ]);
+            // Option (a): delay in same room — only offer it if the pushed-back
+            // start still falls within the room's availability window (rooms
+            // with no slots defined are unrestricted).
+            if ($this->isWithinRoomAvailability($next->room_id, $newStart, $duration)) {
+                $suggestions[] = ScheduleSuggestion::create([
+                    'surgery_id'        => $next->id,
+                    'suggested_room_id' => $next->room_id,
+                    'suggested_start'   => $newStart,
+                    'reason'            => "Delayed by {$pushMinutes} min due to {$reasonPrefix}.",
+                    'status'            => 'pending',
+                ]);
+            }
 
             // Option (b): if another free room fits at the ORIGINAL start, offer it too.
             $alt = $this->findAlternativeRoom(
@@ -215,13 +434,17 @@ class SchedulingService
                     'surgery_id'        => $next->id,
                     'suggested_room_id' => $alt->id,
                     'suggested_start'   => $next->scheduled_start,
-                    'reason'            => "Move to room '{$alt->name}' to keep original start time despite overrun of surgery #{$surgery->id}.",
+                    'reason'            => "Move to room '{$alt->name}' to keep original start time despite {$reasonPrefix}.",
                     'status'            => 'pending',
                 ]);
             }
         }
 
-        // Notify all coordinators once per suggestion.
+        return $suggestions;
+    }
+
+    private function notifyCoordinatorsOfSuggestions(array $suggestions): void
+    {
         $coordinators = User::where('role', 'coordinator')->get();
         foreach ($suggestions as $sug) {
             foreach ($coordinators as $coord) {
@@ -233,13 +456,7 @@ class SchedulingService
                 ]);
             }
         }
-
-        return $suggestions;
     }
-
-    // ---------------------------------------------------------------------
-    // Internals
-    // ---------------------------------------------------------------------
 
     /**
      * Walk candidate rooms and time slots to find the earliest fit.
@@ -312,7 +529,9 @@ class SchedulingService
         $candidate = Carbon::parse($notBefore);
         $candidate = $this->clampToBusinessHours($candidate);
 
-        // Try up to 14 days ahead — production would tune this.
+        $roomSlots = OperatingRoomSlot::where('room_id', $room->id)->get();
+
+        // Try up to 500 iterations (bounded search) — production would tune this.
         for ($safety = 0; $safety < 500; $safety++) {
             $end = $candidate->copy()->addMinutes($durationMin);
 
@@ -322,7 +541,20 @@ class SchedulingService
                 continue;
             }
 
-            // Check room conflicts (with turnover buffer).
+            // Must fit within one of the room's defined availability slots for
+            // that day of week (rooms with zero slots defined are unrestricted).
+            if ($roomSlots->isNotEmpty()) {
+                $fits = $this->fitsInAnySlot($roomSlots, $candidate, $end);
+                if (! $fits) {
+                    // Jump to next day 08:00 and try again — simplest safe
+                    // advance that guarantees forward progress.
+                    $candidate = $candidate->copy()->addDay()->setHour(self::DAY_START_HOUR)->setMinute(0)->setSecond(0);
+                    continue;
+                }
+            }
+
+            // Check room conflicts (with turnover buffer). Intervals already
+            // use each surgery's EFFECTIVE end (see caller).
             $conflict = null;
             foreach ($intervals as [$bStart, $bEnd]) {
                 $bufferedEnd = $bEnd->copy()->addMinutes(self::ROOM_TURNOVER_MIN);
@@ -356,8 +588,32 @@ class SchedulingService
         return $candidate;
     }
 
+    /**
+     * True if [start, end) fits entirely within one of the given slots on
+     * start's day of week.
+     */
+    private function fitsInAnySlot($roomSlots, Carbon $start, Carbon $end): bool
+    {
+        $daySlots = $roomSlots->where('day_of_week', $start->dayOfWeek);
+        foreach ($daySlots as $slot) {
+            $slotStart = $start->copy()->setTimeFromTimeString($slot->start_time);
+            $slotEnd = $start->copy()->setTimeFromTimeString($slot->end_time);
+            if ($start->greaterThanOrEqualTo($slotStart) && $end->lessThanOrEqualTo($slotEnd)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private function clampToBusinessHours(Carbon $t): Carbon
     {
+        // Defensive floor: never return a moment before "now", regardless of
+        // what the caller passed in.
+        $now = Carbon::now();
+        if ($t->lessThan($now)) {
+            $t = $now->copy();
+        }
+
         if ($t->hour < self::DAY_START_HOUR) {
             return $t->setHour(self::DAY_START_HOUR)->setMinute(0)->setSecond(0);
         }
@@ -389,6 +645,13 @@ class SchedulingService
                 && $room->supported_specialty !== $requiredSpecialty) {
                 continue;
             }
+
+            // Must fit within the candidate room's availability slots (if any
+            // are defined for it).
+            if (! $this->isWithinRoomAvailability($room->id, $start, $durationMin)) {
+                continue;
+            }
+
             $intervals = $roomBusy[$room->id] ?? [];
             $ok = true;
             foreach ($intervals as [$bStart, $bEnd]) {
