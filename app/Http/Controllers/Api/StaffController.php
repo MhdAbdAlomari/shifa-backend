@@ -11,11 +11,15 @@ use Illuminate\Validation\Rule;
 
 class StaffController extends Controller
 {
-    public function index()
+    public function index(Request $request)
     {
-        return UserResource::collection(
-            User::whereIn('role', ['coordinator', 'surgeon'])->orderBy('name')->get()
-        );
+        $query = User::whereIn('role', ['coordinator', 'surgeon'])->orderBy('name');
+
+        if ($search = $request->query('search')) {
+            $query->where('name', 'like', '%' . $search . '%');
+        }
+
+        return UserResource::collection($query->get());
     }
 
     public function store(Request $request)

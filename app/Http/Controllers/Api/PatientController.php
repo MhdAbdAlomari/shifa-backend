@@ -10,9 +10,15 @@ use Illuminate\Validation\Rule;
 
 class PatientController extends Controller
 {
-    public function index()
+    public function index(Request $request)
     {
-        return PatientResource::collection(Patient::orderBy('name')->get());
+        $query = Patient::query()->orderBy('name');
+
+        if ($search = $request->query('search')) {
+            $query->where('name', 'like', '%' . $search . '%');
+        }
+
+        return PatientResource::collection($query->get());
     }
 
     public function store(Request $request)
