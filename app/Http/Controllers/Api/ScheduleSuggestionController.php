@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Http\Resources\ScheduleSuggestionResource;
 use App\Models\ScheduleSuggestion;
+use App\Support\ApiError;
 
 class ScheduleSuggestionController extends Controller
 {
@@ -21,7 +22,7 @@ class ScheduleSuggestionController extends Controller
     public function accept(ScheduleSuggestion $suggestion)
     {
         if ($suggestion->status !== 'pending') {
-            return response()->json(['message' => 'Suggestion is not pending.'], 422);
+            return ApiError::make('Suggestion is not pending.', 'suggestion_not_pending', 422, ['current_status' => $suggestion->status]);
         }
 
         // Apply the suggestion to the surgery.
@@ -45,7 +46,7 @@ class ScheduleSuggestionController extends Controller
     public function reject(ScheduleSuggestion $suggestion)
     {
         if ($suggestion->status !== 'pending') {
-            return response()->json(['message' => 'Suggestion is not pending.'], 422);
+            return ApiError::make('Suggestion is not pending.', 'suggestion_not_pending', 422, ['current_status' => $suggestion->status]);
         }
         $suggestion->update(['status' => 'rejected']);
         return new ScheduleSuggestionResource($suggestion);
