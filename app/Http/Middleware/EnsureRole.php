@@ -2,6 +2,7 @@
 
 namespace App\Http\Middleware;
 
+use App\Support\ApiError;
 use Closure;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
@@ -18,13 +19,16 @@ class EnsureRole
         $user = $request->user();
 
         if (! $user) {
-            return response()->json(['message' => 'Unauthenticated.'], 401);
+            return ApiError::make('Unauthenticated.', 'unauthenticated', 401);
         }
 
         if (! in_array($user->role, $roles, true)) {
-            return response()->json([
-                'message' => 'Forbidden. Requires role: ' . implode(' or ', $roles),
-            ], 403);
+            return ApiError::make(
+                'Forbidden. Requires role: ' . implode(' or ', $roles),
+                'role_forbidden',
+                403,
+                ['required_role' => count($roles) === 1 ? $roles[0] : array_values($roles)],
+            );
         }
 
         return $next($request);
