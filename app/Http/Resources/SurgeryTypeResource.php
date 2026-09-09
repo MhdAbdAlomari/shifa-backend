@@ -14,6 +14,7 @@ class SurgeryTypeResource extends JsonResource
             'name' => $this->name,
             'average_duration_min' => $this->average_duration_min,
             'required_specialty' => $this->required_specialty,
+            'default_room_id' => $this->default_room_id,
         ];
     }
 }
