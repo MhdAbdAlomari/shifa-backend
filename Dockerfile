@@ -46,15 +46,9 @@ RUN mkdir -p storage/framework/cache storage/framework/sessions storage/framewor
     && chown -R www-data:www-data storage bootstrap/cache \
     && chmod -R ug+rwX storage bootstrap/cache
 
-# Attempt config + route caching. Both need a valid env at build time
-# (APP_KEY at minimum); Render provides envs at RUNTIME, not build. If
-# either fails here, skip it — Laravel will fall back to non-cached
-# resolution at runtime, which still works fine.
-RUN php artisan config:cache || echo "config:cache skipped (will resolve at runtime)"
-RUN php artisan route:cache || echo "route:cache skipped (will resolve at runtime)"
-
 # Render sets $PORT dynamically. Do NOT hardcode.
 EXPOSE 8000
 
 # Use sh -c so $PORT is expanded at container start, not at build time.
-CMD ["sh", "-c", "php artisan serve --host=0.0.0.0 --port=${PORT:-8000}"]
+# We also clear the cache before serving to ensure the app reads environment variables correctly.
+CMD ["sh", "-c", "php artisan optimize:clear && php artisan serve --host=0.0.0.0 --port=${PORT:-8000}"]
