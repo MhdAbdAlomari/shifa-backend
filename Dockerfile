@@ -11,10 +11,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libfreetype6-dev \
         libonig-dev \
         libxml2-dev \
+        libicu-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Configure GD with jpeg + freetype support before installing it.
 RUN docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-configure intl \
     && docker-php-ext-install -j$(nproc) \
         pdo \
         pdo_mysql \
@@ -24,7 +26,8 @@ RUN docker-php-ext-configure gd --with-freetype --with-jpeg \
         pcntl \
         bcmath \
         gd \
-        zip
+        zip \
+        intl
 
 # Composer, straight from the official image.
 COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
